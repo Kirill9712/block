@@ -1,6 +1,6 @@
 import { registerCommand } from "@vendetta/commands";
 import { logger } from "@vendetta";
-import { findAll, findByProps, findByStoreName } from "@vendetta/metro";
+import { findAll, findByName, findByProps, findByStoreName, findByTypeNameAll } from "@vendetta/metro";
 import { clipboard, FluxDispatcher } from "@vendetta/metro/common";
 import { before, after } from "@vendetta/patcher";
 import { storage } from "@vendetta/plugin";
@@ -26,6 +26,8 @@ const hiddenDmChannels = new Map<string, any>();
 
 let unpatches: Array<() => void> = [];
 let unregisterCommands: Array<() => void> = [];
+let memberPatchTimer: ReturnType<typeof setInterval> | undefined;
+let patchedMemberModules = new WeakSet<object>();
 
 function blockedIds(): string[] {
     storage.users ??= [];
@@ -181,6 +183,49 @@ function recipientIds(channel: any): string[] {
         ...(Array.isArray(channel?.rawRecipients) ? channel.rawRecipients : []),
         channel?.getRecipientId?.()
     ].map(recipient => typeof recipient === "string" ? recipient : recipient?.id).filter(Boolean);
+}
+
+function memberRowUserId(props: any): string | undefined {
+    if (!props || typeof props !== "object") return;
+    return getUserId(props.userId)
+        ?? getUserId(props.user?.id)
+        ?? getUserId(props.member?.userId)
+        ?? getUserId(props.member?.user?.id)
+        ?? getUserId(props.item?.userId)
+        ?? getUserId(props.item?.user?.id)
+        ?? getUserId(props.row?.userId)
+        ?? getUserId(props.row?.user?.id)
+        ?? getUserId(props.data?.userId)
+        ?? getUserId(props.data?.user?.id);
+}
+
+function patchMemberComponent(target: any, method: string): boolean {
+    if (!target || typeof target !== "object" || patchedMemberModules.has(target) || typeof target[method] !== "function") return false;
+    patchedMemberModules.add(target);
+    unpatches.push(after(method, target, ([props], result) => {
+        const userId = memberRowUserId(props);
+        return userId && isBlocked(userId) ? null : result;
+    }));
+    return true;
+}
+
+function patchMembersTab() {
+    try {
+        const raw = findByName("GuildChannelMemberRow", false);
+        if (raw && typeof raw === "object") {
+            for (const key of Object.keys(raw)) {
+                if (raw[key]?.name === "GuildChannelMemberRow" || key === "default") {
+                    patchMemberComponent(raw, key);
+                }
+            }
+        }
+    } catch { }
+
+    try {
+        for (const wrapper of findByTypeNameAll("GuildChannelMemberRow")) {
+            if (wrapper?.type?.name === "GuildChannelMemberRow") patchMemberComponent(wrapper, "type");
+        }
+    } catch { }
 }
 
 function privateChannels(): any[] {
@@ -388,6 +433,11 @@ function registerCommands() {
                 return typeof name === "string" && /member|channel.*detail|detail.*channel/i.test(name);
             }).map(moduleName).filter(Boolean);
 
+            const dmComponentNames = findAll(value => {
+                const name = moduleName(value);
+                return typeof name === "string" && /private.*channel|direct.*message|dm.*row|channel.*row|channel.*item/i.test(name);
+            }).map(moduleName).filter(Boolean);
+
             const memberStores = findAll(value => {
                 try { return typeof value?.getName === "function" && /member/i.test(value.getName()); }
                 catch { return false; }
@@ -406,6 +456,7 @@ function registerCommands() {
                 guildId: ctx?.guild?.id,
                 channelId: ctx?.channel?.id,
                 componentNames: [...new Set(componentNames)],
+                dmComponentNames: [...new Set(dmComponentNames)],
                 memberStores,
                 channelMemberProps: describe(channelMemberProps),
                 threadSections: describe(threadSections),
@@ -427,6 +478,8 @@ export default {
 
         patchDispatcher();
         patchStores();
+        patchMembersTab();
+        memberPatchTimer = setInterval(patchMembersTab, 1000);
         registerCommands();
         blockedIds().forEach(muteVoice);
         blockedIds().forEach(userId => hideDirectMessages(userId));
@@ -435,7 +488,10 @@ export default {
 
     onUnload() {
         unregisterCommands.splice(0).forEach(unregister => unregister());
+        if (memberPatchTimer) clearInterval(memberPatchTimer);
+        memberPatchTimer = undefined;
         unpatches.splice(0).reverse().forEach(unpatch => unpatch());
+        patchedMemberModules = new WeakSet<object>();
         blockedIds().forEach(restoreVoice);
         logger.log("Blacklist unloaded");
     }
