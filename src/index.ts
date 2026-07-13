@@ -28,6 +28,9 @@ let unpatches: Array<() => void> = [];
 let unregisterCommands: Array<() => void> = [];
 let memberPatchTimer: ReturnType<typeof setInterval> | undefined;
 let patchedMemberModules = new WeakSet<object>();
+let patchedMemberComponentCount = 0;
+let memberRowRenderCount = 0;
+let lastMemberRowProps: any;
 
 function blockedIds(): string[] {
     storage.users ??= [];
@@ -185,27 +188,52 @@ function recipientIds(channel: any): string[] {
     ].map(recipient => typeof recipient === "string" ? recipient : recipient?.id).filter(Boolean);
 }
 
-function memberRowUserId(props: any): string | undefined {
-    if (!props || typeof props !== "object") return;
-    return getUserId(props.userId)
+function memberRowUserId(props: any, depth = 0, seen = new Set<any>()): string | undefined {
+    if (!props || typeof props !== "object" || depth > 5 || seen.has(props)) return;
+    seen.add(props);
+
+    const direct = getUserId(props.userId)
+        ?? getUserId(props.user_id)
         ?? getUserId(props.user?.id)
         ?? getUserId(props.member?.userId)
+        ?? getUserId(props.member?.user_id)
+        ?? getUserId(props.member?.id)
         ?? getUserId(props.member?.user?.id)
         ?? getUserId(props.item?.userId)
+        ?? getUserId(props.item?.user_id)
         ?? getUserId(props.item?.user?.id)
         ?? getUserId(props.row?.userId)
+        ?? getUserId(props.row?.user_id)
         ?? getUserId(props.row?.user?.id)
         ?? getUserId(props.data?.userId)
-        ?? getUserId(props.data?.user?.id);
+        ?? getUserId(props.data?.user_id)
+        ?? getUserId(props.data?.user?.id)
+        ?? getUserId(props.guildMember?.userId)
+        ?? getUserId(props.guildMember?.user_id)
+        ?? getUserId(props.guildMember?.user?.id);
+    if (direct) return direct;
+
+    for (const [key, value] of Object.entries(props)) {
+        if (!/user|member|item|row|data|record|entry|payload/i.test(key)) continue;
+        if (typeof value === "string") {
+            const id = getUserId(value);
+            if (id) return id;
+        }
+        const nested = memberRowUserId(value, depth + 1, seen);
+        if (nested) return nested;
+    }
 }
 
 function patchMemberComponent(target: any, method: string): boolean {
     if (!target || typeof target !== "object" || patchedMemberModules.has(target) || typeof target[method] !== "function") return false;
     patchedMemberModules.add(target);
     unpatches.push(after(method, target, ([props], result) => {
+        memberRowRenderCount++;
+        lastMemberRowProps = props;
         const userId = memberRowUserId(props);
         return userId && isBlocked(userId) ? null : result;
     }));
+    patchedMemberComponentCount++;
     return true;
 }
 
@@ -457,6 +485,11 @@ function registerCommands() {
                 channelId: ctx?.channel?.id,
                 componentNames: [...new Set(componentNames)],
                 dmComponentNames: [...new Set(dmComponentNames)],
+                membersPatch: {
+                    patchedComponents: patchedMemberComponentCount,
+                    renderCalls: memberRowRenderCount,
+                    lastProps: describe(lastMemberRowProps)
+                },
                 memberStores,
                 channelMemberProps: describe(channelMemberProps),
                 threadSections: describe(threadSections),
@@ -492,6 +525,9 @@ export default {
         memberPatchTimer = undefined;
         unpatches.splice(0).reverse().forEach(unpatch => unpatch());
         patchedMemberModules = new WeakSet<object>();
+        patchedMemberComponentCount = 0;
+        memberRowRenderCount = 0;
+        lastMemberRowProps = undefined;
         blockedIds().forEach(restoreVoice);
         logger.log("Blacklist unloaded");
     }
