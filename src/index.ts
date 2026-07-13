@@ -308,6 +308,39 @@ function refreshLists() {
     ChannelStore?.emitChange?.();
     try { ChannelMemberStore?.doEmitChanges?.(); } catch { }
     VoiceStateStore?.emitChange?.();
+    try { VoiceStateStore?.doEmitChanges?.(); } catch { }
+}
+
+function voiceUserId(value: any): string | undefined {
+    return getUserId(value?.userId)
+        ?? getUserId(value?.user_id)
+        ?? getUserId(value?.user?.id)
+        ?? getUserId(value?.member?.userId)
+        ?? getUserId(value?.member?.user?.id);
+}
+
+function filterVoiceCollection(result: any): any {
+    if (!result || typeof result !== "object") return result;
+    if (isBlocked(voiceUserId(result))) return undefined;
+
+    if (Array.isArray(result)) {
+        return result
+            .filter(value => !isBlocked(voiceUserId(value)))
+            .map(filterVoiceCollection);
+    }
+
+    if (result instanceof Map) {
+        return new Map([...result.entries()]
+            .filter(([key, value]) => !isBlocked(key) && !isBlocked(voiceUserId(value)))
+            .map(([key, value]) => [key, filterVoiceCollection(value)]));
+    }
+
+    const prototype = Object.getPrototypeOf(result);
+    if (prototype !== Object.prototype && prototype !== null) return result;
+
+    return Object.fromEntries(Object.entries(result)
+        .filter(([key, value]) => !isBlocked(key) && !isBlocked(voiceUserId(value)))
+        .map(([key, value]) => [key, filterVoiceCollection(value)]));
 }
 
 function filterChannelMemberProps(result: any) {
@@ -395,21 +428,14 @@ function patchStores() {
         }));
     }
 
-    if (VoiceStateStore?.getVoiceStatesForChannel) {
-        unpatches.push(after("getVoiceStatesForChannel", VoiceStateStore, (_args, result) => {
-            if (!result || typeof result !== "object") return result;
-            if (Array.isArray(result)) return result.filter(state => !isBlocked(state?.userId ?? state?.user_id));
-            if (result instanceof Map) {
-                return new Map([...result.entries()].filter(([userId, state]: [string, any]) => {
-                    return !isBlocked(userId) && !isBlocked(state?.userId ?? state?.user_id);
-                }));
-            }
+    for (const method of ["getVoiceStatesForChannel", "getVoiceStates", "getVoiceStatesForGuild", "getVoiceStateForChannel"]) {
+        if (typeof VoiceStateStore?.[method] !== "function") continue;
+        unpatches.push(after(method, VoiceStateStore, (_args, result) => filterVoiceCollection(result)));
+    }
 
-            const prototype = Object.getPrototypeOf(result);
-            if (prototype !== Object.prototype && prototype !== null) return result;
-            return Object.fromEntries(Object.entries(result).filter(([userId, state]: [string, any]) => {
-                return !isBlocked(userId) && !isBlocked(state?.userId ?? state?.user_id);
-            }));
+    if (typeof VoiceStateStore?.getVoiceStateForUser === "function") {
+        unpatches.push(after("getVoiceStateForUser", VoiceStateStore, ([userId], result) => {
+            return isBlocked(userId) || isBlocked(voiceUserId(result)) ? undefined : result;
         }));
     }
 
@@ -510,8 +536,17 @@ function registerCommands() {
 
             let channelMemberProps: any;
             let threadSections: any;
+            let voiceStates: any;
             try { channelMemberProps = ChannelMemberStore?.getProps?.(ctx?.guild?.id, ctx?.channel?.id); } catch (error) { channelMemberProps = String(error); }
             try { threadSections = ThreadMemberListStore?.getMemberListSections?.(ctx?.channel?.id); } catch (error) { threadSections = String(error); }
+            try {
+                const voiceChannelId = SelectedChannelStore?.getVoiceChannelId?.();
+                voiceStates = {
+                    voiceChannelId,
+                    forChannel: describe(VoiceStateStore?.getVoiceStatesForChannel?.(voiceChannelId)),
+                    forGuild: describe(VoiceStateStore?.getVoiceStates?.(ctx?.guild?.id ?? ctx?.channel?.guild_id))
+                };
+            } catch (error) { voiceStates = String(error); }
 
             const report = JSON.stringify({
                 blockedIds: blockedIds(),
@@ -527,6 +562,15 @@ function registerCommands() {
                 memberStores,
                 channelMemberProps: describe(channelMemberProps),
                 threadSections: describe(threadSections),
+                voiceStates,
+                voiceStoreMethods: (() => {
+                    const names = new Set<string>();
+                    let current = VoiceStateStore;
+                    for (let depth = 0; current && depth < 4; depth++, current = Object.getPrototypeOf(current)) {
+                        Reflect.ownKeys(current).forEach(key => typeof key === "string" && /voice|state/i.test(key) && names.add(key));
+                    }
+                    return [...names];
+                })(),
                 channelStoreMethods: Object.keys(ChannelStore ?? {}).filter(key => /private|dm/i.test(key)),
                 privateSortMethods: Object.keys(PrivateChannelSortStore ?? {}).filter(key => typeof PrivateChannelSortStore[key] === "function")
             }, null, 2);
