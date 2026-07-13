@@ -24,6 +24,7 @@ const ChannelMemberStore = findByStoreName("ChannelMemberStore");
 const ThreadMemberListStore = findByStoreName("ThreadMemberListStore");
 const hiddenDmChannels = new Map<string, any>();
 const hiddenVoiceStates = new Map<string, any>();
+const hiddenVoiceChannels = new Map<string, any>();
 
 let unpatches: Array<() => void> = [];
 let unregisterCommands: Array<() => void> = [];
@@ -37,6 +38,7 @@ let patchedVoiceComponentCount = 0;
 let voiceRowRenderCount = 0;
 let lastVoiceRowProps: any;
 let originalGetVoiceStateForUser: ((userId: string) => any) | undefined;
+let originalGetVoiceStatesForChannel: ((channelId: string) => any) | undefined;
 
 function blockedIds(): string[] {
     storage.users ??= [];
@@ -314,6 +316,32 @@ function currentVoiceState(userId: string): any {
     catch { return undefined; }
 }
 
+function voiceStateValues(value: any): any[] {
+    if (!value || typeof value !== "object") return [];
+    if (Array.isArray(value)) return value;
+    if (value instanceof Map) return [...value.values()];
+    return Object.values(value);
+}
+
+function restoreVoiceChannel(channelId: string | undefined) {
+    if (!channelId) return;
+    const channel = hiddenVoiceChannels.get(channelId);
+    hiddenVoiceChannels.delete(channelId);
+    if (channel) FluxDispatcher.dispatch({ type: "CHANNEL_CREATE", channel });
+}
+
+function hideEmptyVoiceChannel(channelId: string | undefined) {
+    if (!channelId || hiddenVoiceChannels.has(channelId)) return;
+    let states: any[] = [];
+    try { states = voiceStateValues(originalGetVoiceStatesForChannel?.(channelId)); } catch { }
+    if (states.some(state => !isBlocked(voiceUserId(state)))) return;
+
+    const channel = ChannelStore?.getChannel?.(channelId);
+    if (!channel) return;
+    hiddenVoiceChannels.set(channelId, channel);
+    FluxDispatcher.dispatch({ type: "CHANNEL_DELETE", channel });
+}
+
 function hideVoicePresence(userId: string, state = currentVoiceState(userId)) {
     if (!state || !(state.channelId ?? state.channel_id)) return;
     hiddenVoiceStates.set(userId, { ...state });
@@ -321,12 +349,16 @@ function hideVoicePresence(userId: string, state = currentVoiceState(userId)) {
         type: "VOICE_STATE_UPDATES",
         voiceStates: [{ ...state, channelId: null, channel_id: null }]
     });
+    hideEmptyVoiceChannel(state.channelId ?? state.channel_id);
 }
 
 function restoreVoicePresence(userId: string) {
     const state = hiddenVoiceStates.get(userId);
     hiddenVoiceStates.delete(userId);
-    if (state) FluxDispatcher.dispatch({ type: "VOICE_STATE_UPDATES", voiceStates: [state] });
+    if (state) {
+        restoreVoiceChannel(state.channelId ?? state.channel_id);
+        FluxDispatcher.dispatch({ type: "VOICE_STATE_UPDATES", voiceStates: [state] });
+    }
 }
 
 function refreshLists() {
@@ -504,14 +536,23 @@ function patchDispatcher() {
         }
 
         if (event.type === "VOICE_STATE_UPDATES" && Array.isArray(event.voiceStates)) {
+            const channelsToCheck = new Set<string>();
             event.voiceStates = event.voiceStates.map((state: any) => {
                 const userId = state?.userId ?? state?.user_id;
-                if (!isBlocked(userId)) return state;
+                const channelId = state?.channelId ?? state?.channel_id;
+                if (!isBlocked(userId)) {
+                    if (channelId && hiddenVoiceChannels.has(channelId)) setTimeout(() => restoreVoiceChannel(channelId), 0);
+                    return state;
+                }
 
-                if (state.channelId ?? state.channel_id) hiddenVoiceStates.set(userId, { ...state });
+                if (channelId) {
+                    hiddenVoiceStates.set(userId, { ...state });
+                    channelsToCheck.add(channelId);
+                }
                 muteVoice(userId);
                 return { ...state, channelId: null, channel_id: null };
             });
+            if (channelsToCheck.size) setTimeout(() => channelsToCheck.forEach(hideEmptyVoiceChannel), 0);
         }
     }));
 }
@@ -703,6 +744,7 @@ export default {
         storage.voiceVolumes ??= {};
         storage.soundboardMutes ??= {};
         originalGetVoiceStateForUser = VoiceStateStore?.getVoiceStateForUser?.bind(VoiceStateStore);
+        originalGetVoiceStatesForChannel = VoiceStateStore?.getVoiceStatesForChannel?.bind(VoiceStateStore);
 
         patchDispatcher();
         patchStores();
@@ -733,7 +775,9 @@ export default {
         voiceRowRenderCount = 0;
         lastVoiceRowProps = undefined;
         blockedIds().forEach(restoreVoicePresence);
+        [...hiddenVoiceChannels.keys()].forEach(restoreVoiceChannel);
         originalGetVoiceStateForUser = undefined;
+        originalGetVoiceStatesForChannel = undefined;
         blockedIds().forEach(restoreVoice);
         logger.log("Blacklist unloaded");
     }
