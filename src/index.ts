@@ -23,6 +23,7 @@ const PrivateChannelSortStore = findByStoreName("PrivateChannelSortStore");
 const ChannelMemberStore = findByStoreName("ChannelMemberStore");
 const ThreadMemberListStore = findByStoreName("ThreadMemberListStore");
 const hiddenDmChannels = new Map<string, any>();
+const hiddenVoiceStates = new Map<string, any>();
 
 let unpatches: Array<() => void> = [];
 let unregisterCommands: Array<() => void> = [];
@@ -35,6 +36,7 @@ let patchedVoiceModules = new WeakSet<object>();
 let patchedVoiceComponentCount = 0;
 let voiceRowRenderCount = 0;
 let lastVoiceRowProps: any;
+let originalGetVoiceStateForUser: ((userId: string) => any) | undefined;
 
 function blockedIds(): string[] {
     storage.users ??= [];
@@ -307,6 +309,26 @@ function restoreDirectMessage(userId: string) {
     hiddenDmChannels.delete(userId);
 }
 
+function currentVoiceState(userId: string): any {
+    try { return originalGetVoiceStateForUser?.(userId); }
+    catch { return undefined; }
+}
+
+function hideVoicePresence(userId: string, state = currentVoiceState(userId)) {
+    if (!state || !(state.channelId ?? state.channel_id)) return;
+    hiddenVoiceStates.set(userId, { ...state });
+    FluxDispatcher.dispatch({
+        type: "VOICE_STATE_UPDATES",
+        voiceStates: [{ ...state, channelId: null, channel_id: null }]
+    });
+}
+
+function restoreVoicePresence(userId: string) {
+    const state = hiddenVoiceStates.get(userId);
+    hiddenVoiceStates.delete(userId);
+    if (state) FluxDispatcher.dispatch({ type: "VOICE_STATE_UPDATES", voiceStates: [state] });
+}
+
 function refreshLists() {
     PrivateChannelSortStore?.emitChange?.();
     ChannelStore?.emitChange?.();
@@ -482,11 +504,14 @@ function patchDispatcher() {
         }
 
         if (event.type === "VOICE_STATE_UPDATES" && Array.isArray(event.voiceStates)) {
-            // Keep the update flowing so Discord's audio engine remains stable;
-            // the voice store getter below hides the row from the channel list.
-            for (const state of event.voiceStates) {
-                if (isBlocked(state?.userId ?? state?.user_id)) muteVoice(state.userId ?? state.user_id);
-            }
+            event.voiceStates = event.voiceStates.map((state: any) => {
+                const userId = state?.userId ?? state?.user_id;
+                if (!isBlocked(userId)) return state;
+
+                if (state.channelId ?? state.channel_id) hiddenVoiceStates.set(userId, { ...state });
+                muteVoice(userId);
+                return { ...state, channelId: null, channel_id: null };
+            });
         }
     }));
 }
@@ -551,8 +576,10 @@ function registerCommands() {
             if (isBlocked(userId)) return failure(`${nameFor(userId)} уже скрыт`);
 
             const dmChannels = findDirectMessages(userId);
+            const voiceState = currentVoiceState(userId);
             storage.users = [...blockedIds(), userId];
             muteVoice(userId);
+            hideVoicePresence(userId, voiceState);
             removeMountedMessages(userId);
             hideDirectMessages(userId, dmChannels);
             refreshLists();
@@ -572,6 +599,7 @@ function registerCommands() {
 
             storage.users = blockedIds().filter(id => id !== userId);
             restoreVoice(userId);
+            restoreVoicePresence(userId);
             restoreDirectMessage(userId);
             refreshLists();
             void refreshMessages();
@@ -674,6 +702,7 @@ export default {
         storage.users ??= [];
         storage.voiceVolumes ??= {};
         storage.soundboardMutes ??= {};
+        originalGetVoiceStateForUser = VoiceStateStore?.getVoiceStateForUser?.bind(VoiceStateStore);
 
         patchDispatcher();
         patchStores();
@@ -685,6 +714,7 @@ export default {
         }, 1000);
         registerCommands();
         blockedIds().forEach(muteVoice);
+        blockedIds().forEach(userId => hideVoicePresence(userId));
         blockedIds().forEach(userId => hideDirectMessages(userId));
         logger.log("Blacklist loaded");
     },
@@ -702,6 +732,8 @@ export default {
         patchedVoiceComponentCount = 0;
         voiceRowRenderCount = 0;
         lastVoiceRowProps = undefined;
+        blockedIds().forEach(restoreVoicePresence);
+        originalGetVoiceStateForUser = undefined;
         blockedIds().forEach(restoreVoice);
         logger.log("Blacklist unloaded");
     }
