@@ -20,6 +20,9 @@ const SoundboardStore = findByProps("isLocalSoundboardMuted");
 const MessageActions = findByProps("fetchMessages");
 const ChannelStore = findByStoreName("ChannelStore");
 const PrivateChannelSortStore = findByStoreName("PrivateChannelSortStore");
+const GuildMemberStore = findByStoreName("GuildMemberStore");
+const ChannelMemberStore = findByStoreName("ChannelMemberStore");
+const ThreadMemberListStore = findByStoreName("ThreadMemberListStore");
 
 let unpatches: Array<() => void> = [];
 let unregisterCommands: Array<() => void> = [];
@@ -194,8 +197,68 @@ function isHiddenDirectMessage(channelId: string): boolean {
     return recipientIds.some(isBlocked);
 }
 
+function filterPrivateChannels(result: any): any {
+    if (!result || typeof result !== "object") return result;
+
+    if (Array.isArray(result)) {
+        return result.filter(value => {
+            const channelId = typeof value === "string" ? value : value?.id;
+            return !channelId || !isHiddenDirectMessage(channelId);
+        });
+    }
+
+    if (result instanceof Map) {
+        return new Map([...result.entries()].filter(([channelId, channel]) => {
+            const id = channel?.id ?? channelId;
+            return !isHiddenDirectMessage(id);
+        }));
+    }
+
+    const prototype = Object.getPrototypeOf(result);
+    if (prototype !== Object.prototype && prototype !== null) return result;
+
+    return Object.fromEntries(Object.entries(result).filter(([channelId, channel]: [string, any]) => {
+        const id = channel?.id ?? channelId;
+        return !isHiddenDirectMessage(id);
+    }));
+}
+
+function filterMemberCollection(result: any, depth = 0): any {
+    if (!result || typeof result !== "object" || depth > 3) return result;
+
+    if (Array.isArray(result)) {
+        // Arrays can contain user IDs, member/row objects, or whole sections.
+        return result
+            .filter(value => {
+                if (typeof value === "string" && /^\d{17,20}$/.test(value)) return !isBlocked(value);
+                const userId = directMemberId(value);
+                return !userId || !isBlocked(userId);
+            })
+            .map(value => filterMemberCollection(value, depth + 1));
+    }
+
+    if (result instanceof Map) {
+        return new Map([...result.entries()]
+            .filter(([key, value]) => !isBlocked(key) && !isBlocked(directMemberId(value)))
+            .map(([key, value]) => [key, filterMemberCollection(value, depth + 1)]));
+    }
+
+    const prototype = Object.getPrototypeOf(result);
+    if (prototype !== Object.prototype && prototype !== null) return result;
+
+    const next: AnyRecord = { ...result };
+    for (const key of ["userIds", "rows", "items", "members", "sections"]) {
+        if (key in next) next[key] = filterMemberCollection(next[key], depth + 1);
+    }
+    return next;
+}
+
 function refreshLists() {
     PrivateChannelSortStore?.emitChange?.();
+    ChannelStore?.emitChange?.();
+    GuildMemberStore?.emitChange?.();
+    ChannelMemberStore?.emitChange?.();
+    ThreadMemberListStore?.emitChange?.();
     VoiceStateStore?.emitChange?.();
 }
 
@@ -262,18 +325,26 @@ function patchStores() {
         }));
     }
 
-    if (PrivateChannelSortStore?.getPrivateChannelIds) {
-        unpatches.push(after("getPrivateChannelIds", PrivateChannelSortStore, (_args, result) => {
-            return Array.isArray(result) ? result.filter(channelId => !isHiddenDirectMessage(channelId)) : result;
-        }));
+    for (const method of ["getPrivateChannelIds", "getPinnedChannelIds"]) {
+        if (typeof PrivateChannelSortStore?.[method] !== "function") continue;
+        unpatches.push(after(method, PrivateChannelSortStore, (_args, result) => filterPrivateChannels(result)));
     }
 
-    if (ChannelStore?.getSortedPrivateChannels) {
-        unpatches.push(after("getSortedPrivateChannels", ChannelStore, (_args, result) => {
-            return Array.isArray(result)
-                ? result.filter(channel => !isHiddenDirectMessage(channel?.id))
-                : result;
-        }));
+    for (const method of ["getSortedPrivateChannels", "getPrivateChannels", "getMutablePrivateChannels"]) {
+        if (typeof ChannelStore?.[method] !== "function") continue;
+        unpatches.push(after(method, ChannelStore, (_args, result) => filterPrivateChannels(result)));
+    }
+
+    if (typeof GuildMemberStore?.getMembers === "function") {
+        unpatches.push(after("getMembers", GuildMemberStore, (_args, result) => filterMemberCollection(result)));
+    }
+
+    if (typeof ChannelMemberStore?.getProps === "function") {
+        unpatches.push(after("getProps", ChannelMemberStore, (_args, result) => filterMemberCollection(result)));
+    }
+
+    if (typeof ThreadMemberListStore?.getMemberListSections === "function") {
+        unpatches.push(after("getMemberListSections", ThreadMemberListStore, (_args, result) => filterMemberCollection(result)));
     }
 
     // UserRow is used by the mobile member and voice lists. Returning null for
