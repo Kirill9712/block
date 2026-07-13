@@ -1,6 +1,6 @@
 import { registerCommand } from "@vendetta/commands";
 import { logger } from "@vendetta";
-import { findByName, findByProps } from "@vendetta/metro";
+import { findByProps, findByStoreName, findByTypeNameAll } from "@vendetta/metro";
 import { FluxDispatcher } from "@vendetta/metro/common";
 import { before, after } from "@vendetta/patcher";
 import { storage } from "@vendetta/plugin";
@@ -17,7 +17,9 @@ const VoiceStateStore = findByProps("getVoiceStatesForChannel");
 const MediaEngineStore = findByProps("getLocalVolume");
 const MediaEngineActions = findByProps("setLocalVolume");
 const SoundboardStore = findByProps("isLocalSoundboardMuted");
-const RowManager = findByName("RowManager");
+const MessageActions = findByProps("fetchMessages");
+const ChannelStore = findByStoreName("ChannelStore");
+const PrivateChannelSortStore = findByStoreName("PrivateChannelSortStore");
 
 let unpatches: Array<() => void> = [];
 let unregisterCommands: Array<() => void> = [];
@@ -155,13 +157,19 @@ function removeMountedMessages(userId: string) {
     }
 }
 
-function refreshChannel() {
+async function refreshMessages() {
     const channelId = SelectedChannelStore?.getChannelId?.();
     if (!channelId) return;
 
-    // Re-selecting the same channel makes Discord request/render its cached
-    // history again. LOAD_MESSAGES_SUCCESS below then applies the new list.
-    FluxDispatcher.dispatch({ type: "CHANNEL_SELECT", channelId, guildId: null });
+    try {
+        await MessageActions?.fetchMessages?.({ channelId });
+    } catch {
+        try {
+            await MessageActions?.fetchMessages?.(channelId);
+        } catch (error) {
+            logger.warn("Failed to refresh messages after unblock", error);
+        }
+    }
 }
 
 function directMemberId(item: any): string | undefined {
@@ -172,17 +180,23 @@ function directMemberId(item: any): string | undefined {
         ?? item?.voiceState?.userId;
 }
 
-function filterMemberItems(items: any[]): any[] {
-    return items.filter(item => !isBlocked(directMemberId(item)));
+function isHiddenDirectMessage(channelId: string): boolean {
+    const channel = ChannelStore?.getChannel?.(channelId);
+    if (!channel || !(channel.type === 1 || channel.isDM?.())) return false;
+
+    const recipientIds = [
+        ...(Array.isArray(channel.recipients) ? channel.recipients : []),
+        ...(Array.isArray(channel.rawRecipients) ? channel.rawRecipients : [])
+    ].map(recipient => typeof recipient === "string" ? recipient : recipient?.id);
+
+    const recipientId = channel.getRecipientId?.();
+    if (recipientId) recipientIds.push(recipientId);
+    return recipientIds.some(isBlocked);
 }
 
-function filterMemberListEvent(event: any) {
-    if (Array.isArray(event.items)) event.items = filterMemberItems(event.items);
-    if (!Array.isArray(event.ops)) return;
-
-    for (const op of event.ops) {
-        if (Array.isArray(op?.items)) op.items = filterMemberItems(op.items);
-    }
+function refreshLists() {
+    PrivateChannelSortStore?.emitChange?.();
+    VoiceStateStore?.emitChange?.();
 }
 
 function patchDispatcher() {
@@ -212,8 +226,6 @@ function patchDispatcher() {
             return;
         }
 
-        if (event.type === "GUILD_MEMBER_LIST_UPDATE") filterMemberListEvent(event);
-
         if (event.type === "VOICE_STATE_UPDATES" && Array.isArray(event.voiceStates)) {
             // Keep the update flowing so Discord's audio engine remains stable;
             // the voice store getter below hides the row from the channel list.
@@ -236,26 +248,42 @@ function patchStores() {
         unpatches.push(after("getVoiceStatesForChannel", VoiceStateStore, (_args, result) => {
             if (!result || typeof result !== "object") return result;
             if (Array.isArray(result)) return result.filter(state => !isBlocked(state?.userId ?? state?.user_id));
+            if (result instanceof Map) {
+                return new Map([...result.entries()].filter(([userId, state]: [string, any]) => {
+                    return !isBlocked(userId) && !isBlocked(state?.userId ?? state?.user_id);
+                }));
+            }
+
+            const prototype = Object.getPrototypeOf(result);
+            if (prototype !== Object.prototype && prototype !== null) return result;
             return Object.fromEntries(Object.entries(result).filter(([userId, state]: [string, any]) => {
                 return !isBlocked(userId) && !isBlocked(state?.userId ?? state?.user_id);
             }));
         }));
     }
 
-    // Older Discord mobile builds can keep a row after its message was removed
-    // from the store. Suppress that row during generation as a fallback.
-    if (RowManager?.prototype?.generate) {
-        unpatches.push(before("generate", RowManager.prototype, ([data]) => {
-            if (!isBlocked(data?.message?.author?.id)) return;
-            data.message.content = null;
-            data.message.reactions = [];
-            data.message.attachments = [];
-            data.message.embeds = [];
-            data.message.components = [];
-            data.renderContentOnly = true;
-            data.content = [];
+    if (PrivateChannelSortStore?.getPrivateChannelIds) {
+        unpatches.push(after("getPrivateChannelIds", PrivateChannelSortStore, (_args, result) => {
+            return Array.isArray(result) ? result.filter(channelId => !isHiddenDirectMessage(channelId)) : result;
         }));
     }
+
+    if (ChannelStore?.getSortedPrivateChannels) {
+        unpatches.push(after("getSortedPrivateChannels", ChannelStore, (_args, result) => {
+            return Array.isArray(result)
+                ? result.filter(channel => !isHiddenDirectMessage(channel?.id))
+                : result;
+        }));
+    }
+
+    // UserRow is used by the mobile member and voice lists. Returning null for
+    // one row is safer than modifying Discord's GUILD_MEMBER_LIST_UPDATE data.
+    findByTypeNameAll("UserRow").forEach(UserRow => {
+        if (!UserRow?.type) return;
+        unpatches.push(after("type", UserRow, ([props], result) => {
+            return isBlocked(directMemberId(props)) ? null : result;
+        }));
+    });
 }
 
 function registerCommands() {
@@ -283,6 +311,7 @@ function registerCommands() {
             storage.users = [...blockedIds(), userId];
             muteVoice(userId);
             removeMountedMessages(userId);
+            refreshLists();
             FluxDispatcher.dispatch({ type: "BLACKLIST_REFRESH" });
             success(`${nameFor(userId)} добавлен в список`);
         }
@@ -299,7 +328,8 @@ function registerCommands() {
 
             storage.users = blockedIds().filter(id => id !== userId);
             restoreVoice(userId);
-            refreshChannel();
+            refreshLists();
+            void refreshMessages();
         }
     } as any));
 }
