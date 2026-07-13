@@ -306,7 +306,37 @@ function restoreDirectMessage(userId: string) {
 function refreshLists() {
     PrivateChannelSortStore?.emitChange?.();
     ChannelStore?.emitChange?.();
+    try { ChannelMemberStore?.doEmitChanges?.(); } catch { }
     VoiceStateStore?.emitChange?.();
+}
+
+function filterChannelMemberProps(result: any) {
+    if (!result || !Array.isArray(result.rows) || !Array.isArray(result.groups)) return result;
+
+    const counts = new Map<string, number>();
+    let currentGroupId: string | undefined;
+    const visibleRows = result.rows.filter((row: any) => {
+        if (row?.type === "GROUP") {
+            currentGroupId = row.id;
+            counts.set(currentGroupId!, 0);
+            return true;
+        }
+
+        if (row?.type === "MEMBER" && isBlocked(row.userId ?? row.user?.id)) return false;
+        if (currentGroupId) counts.set(currentGroupId, (counts.get(currentGroupId) ?? 0) + 1);
+        return true;
+    });
+
+    const rows = visibleRows.filter((row: any) => row?.type !== "GROUP" || (counts.get(row.id) ?? 0) > 0);
+    const groups = result.groups
+        .map((group: any) => ({
+            ...group,
+            count: counts.get(group.id) ?? group.count,
+            index: rows.findIndex((row: any) => row?.type === "GROUP" && row.id === group.id)
+        }))
+        .filter((group: any) => group.count > 0 && group.index >= 0);
+
+    return { ...result, groups, rows };
 }
 
 function patchDispatcher() {
@@ -381,6 +411,10 @@ function patchStores() {
                 return !isBlocked(userId) && !isBlocked(state?.userId ?? state?.user_id);
             }));
         }));
+    }
+
+    if (ChannelMemberStore?.getProps) {
+        unpatches.push(after("getProps", ChannelMemberStore, (_args, result) => filterChannelMemberProps(result)));
     }
 
 }
