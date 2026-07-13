@@ -1,1 +1,1 @@
-{"name":"Blacklist","description":"Locally hides selected users, their messages, typing and voice presence.","authors":[{"name":"Flarya","id":"435847641041993759"}],"main":"index.js","vendetta":{"icon":"ic_block"},"hash":"c2df3f2c1e883910f25f04475fb3cf8e5484e96cc59743b257b3797c2505eae8"}
+{"name":"Blacklist","description":"Locally hides selected users, their messages, typing and voice presence.","authors":[{"name":"Flarya","id":"435847641041993759"}],"main":"index.js","vendetta":{"icon":"ic_block"},"hash":"e12e8cf2164e99690bf2b2e41efb0b85991e3f1d303db6102814360004d3b18b"}

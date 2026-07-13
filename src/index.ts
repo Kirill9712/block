@@ -1,7 +1,7 @@
 import { registerCommand } from "@vendetta/commands";
 import { logger } from "@vendetta";
-import { findByProps, findByStoreName, findByTypeNameAll } from "@vendetta/metro";
-import { FluxDispatcher } from "@vendetta/metro/common";
+import { findAll, findByProps, findByStoreName } from "@vendetta/metro";
+import { clipboard, FluxDispatcher } from "@vendetta/metro/common";
 import { before, after } from "@vendetta/patcher";
 import { storage } from "@vendetta/plugin";
 import { getAssetIDByName } from "@vendetta/ui/assets";
@@ -20,9 +20,9 @@ const SoundboardStore = findByProps("isLocalSoundboardMuted");
 const MessageActions = findByProps("fetchMessages");
 const ChannelStore = findByStoreName("ChannelStore");
 const PrivateChannelSortStore = findByStoreName("PrivateChannelSortStore");
-const GuildMemberStore = findByStoreName("GuildMemberStore");
 const ChannelMemberStore = findByStoreName("ChannelMemberStore");
 const ThreadMemberListStore = findByStoreName("ThreadMemberListStore");
+const hiddenDmChannels = new Map<string, any>();
 
 let unpatches: Array<() => void> = [];
 let unregisterCommands: Array<() => void> = [];
@@ -175,90 +175,64 @@ async function refreshMessages() {
     }
 }
 
-function directMemberId(item: any): string | undefined {
-    return item?.member?.user?.id
-        ?? item?.member?.userId
-        ?? item?.user?.id
-        ?? item?.userId
-        ?? item?.voiceState?.userId;
+function recipientIds(channel: any): string[] {
+    return [
+        ...(Array.isArray(channel?.recipients) ? channel.recipients : []),
+        ...(Array.isArray(channel?.rawRecipients) ? channel.rawRecipients : []),
+        channel?.getRecipientId?.()
+    ].map(recipient => typeof recipient === "string" ? recipient : recipient?.id).filter(Boolean);
 }
 
-function isHiddenDirectMessage(channelId: string): boolean {
-    const channel = ChannelStore?.getChannel?.(channelId);
-    if (!channel || !(channel.type === 1 || channel.isDM?.())) return false;
-
-    const recipientIds = [
-        ...(Array.isArray(channel.recipients) ? channel.recipients : []),
-        ...(Array.isArray(channel.rawRecipients) ? channel.rawRecipients : [])
-    ].map(recipient => typeof recipient === "string" ? recipient : recipient?.id);
-
-    const recipientId = channel.getRecipientId?.();
-    if (recipientId) recipientIds.push(recipientId);
-    return recipientIds.some(isBlocked);
+function privateChannels(): any[] {
+    const channels = new Map<string, any>();
+    for (const method of ["getSortedPrivateChannels", "getPrivateChannels", "getMutablePrivateChannels"]) {
+        try {
+            const result = ChannelStore?.[method]?.();
+            const values = Array.isArray(result)
+                ? result
+                : result instanceof Map
+                    ? [...result.values()]
+                    : result && typeof result === "object"
+                        ? Object.values(result)
+                        : [];
+            for (const value of values) {
+                const channel = typeof value === "string" ? ChannelStore?.getChannel?.(value) : value;
+                if (channel?.id) channels.set(channel.id, channel);
+            }
+        } catch { }
+    }
+    return [...channels.values()];
 }
 
-function filterPrivateChannels(result: any): any {
-    if (!result || typeof result !== "object") return result;
+function findDirectMessages(userId: string): any[] {
+    const result = privateChannels().filter(channel => {
+        return (channel?.type === 1 || channel?.isDM?.()) && recipientIds(channel).includes(userId);
+    });
 
-    if (Array.isArray(result)) {
-        return result.filter(value => {
-            const channelId = typeof value === "string" ? value : value?.id;
-            return !channelId || !isHiddenDirectMessage(channelId);
-        });
-    }
-
-    if (result instanceof Map) {
-        return new Map([...result.entries()].filter(([channelId, channel]) => {
-            const id = channel?.id ?? channelId;
-            return !isHiddenDirectMessage(id);
-        }));
-    }
-
-    const prototype = Object.getPrototypeOf(result);
-    if (prototype !== Object.prototype && prototype !== null) return result;
-
-    return Object.fromEntries(Object.entries(result).filter(([channelId, channel]: [string, any]) => {
-        const id = channel?.id ?? channelId;
-        return !isHiddenDirectMessage(id);
-    }));
+    try {
+        const dm = ChannelStore?.getDMFromUserId?.(userId);
+        const channel = typeof dm === "string" ? ChannelStore?.getChannel?.(dm) : dm;
+        if (channel?.id && !result.some(value => value.id === channel.id)) result.push(channel);
+    } catch { }
+    return result;
 }
 
-function filterMemberCollection(result: any, depth = 0): any {
-    if (!result || typeof result !== "object" || depth > 3) return result;
-
-    if (Array.isArray(result)) {
-        // Arrays can contain user IDs, member/row objects, or whole sections.
-        return result
-            .filter(value => {
-                if (typeof value === "string" && /^\d{17,20}$/.test(value)) return !isBlocked(value);
-                const userId = directMemberId(value);
-                return !userId || !isBlocked(userId);
-            })
-            .map(value => filterMemberCollection(value, depth + 1));
+function hideDirectMessages(userId: string, knownChannels = findDirectMessages(userId)) {
+    for (const channel of knownChannels) {
+        hiddenDmChannels.set(userId, channel);
+        FluxDispatcher.dispatch({ type: "CHANNEL_DELETE", channel });
     }
+}
 
-    if (result instanceof Map) {
-        return new Map([...result.entries()]
-            .filter(([key, value]) => !isBlocked(key) && !isBlocked(directMemberId(value)))
-            .map(([key, value]) => [key, filterMemberCollection(value, depth + 1)]));
-    }
-
-    const prototype = Object.getPrototypeOf(result);
-    if (prototype !== Object.prototype && prototype !== null) return result;
-
-    const next: AnyRecord = { ...result };
-    for (const key of ["userIds", "rows", "items", "members", "sections"]) {
-        if (key in next) next[key] = filterMemberCollection(next[key], depth + 1);
-    }
-    return next;
+function restoreDirectMessage(userId: string) {
+    const channel = hiddenDmChannels.get(userId);
+    if (channel) FluxDispatcher.dispatch({ type: "CHANNEL_CREATE", channel });
+    hiddenDmChannels.delete(userId);
 }
 
 function refreshLists() {
     PrivateChannelSortStore?.emitChange?.();
     ChannelStore?.emitChange?.();
-    GuildMemberStore?.emitChange?.();
-    ChannelMemberStore?.emitChange?.();
-    ThreadMemberListStore?.emitChange?.();
     VoiceStateStore?.emitChange?.();
 }
 
@@ -286,6 +260,17 @@ function patchDispatcher() {
 
         if ((event.type === "TYPING_START" || event.type === "TYPING_START_LOCAL") && isBlocked(event.userId ?? event.user_id)) {
             event.type = "BLACKLIST_IGNORED_TYPING";
+            return;
+        }
+
+        const createdDmIsBlocked = event.channel
+            && (event.channel.type === 1 || event.channel.isDM?.())
+            && recipientIds(event.channel).some(isBlocked);
+        if (event.type === "CHANNEL_CREATE" && createdDmIsBlocked) {
+            const userId = recipientIds(event.channel).find(isBlocked);
+            if (userId) hiddenDmChannels.set(userId, event.channel);
+            event.type = "BLACKLIST_IGNORED_DM";
+            event.channel = null;
             return;
         }
 
@@ -325,36 +310,6 @@ function patchStores() {
         }));
     }
 
-    for (const method of ["getPrivateChannelIds", "getPinnedChannelIds"]) {
-        if (typeof PrivateChannelSortStore?.[method] !== "function") continue;
-        unpatches.push(after(method, PrivateChannelSortStore, (_args, result) => filterPrivateChannels(result)));
-    }
-
-    for (const method of ["getSortedPrivateChannels", "getPrivateChannels", "getMutablePrivateChannels"]) {
-        if (typeof ChannelStore?.[method] !== "function") continue;
-        unpatches.push(after(method, ChannelStore, (_args, result) => filterPrivateChannels(result)));
-    }
-
-    if (typeof GuildMemberStore?.getMembers === "function") {
-        unpatches.push(after("getMembers", GuildMemberStore, (_args, result) => filterMemberCollection(result)));
-    }
-
-    if (typeof ChannelMemberStore?.getProps === "function") {
-        unpatches.push(after("getProps", ChannelMemberStore, (_args, result) => filterMemberCollection(result)));
-    }
-
-    if (typeof ThreadMemberListStore?.getMemberListSections === "function") {
-        unpatches.push(after("getMemberListSections", ThreadMemberListStore, (_args, result) => filterMemberCollection(result)));
-    }
-
-    // UserRow is used by the mobile member and voice lists. Returning null for
-    // one row is safer than modifying Discord's GUILD_MEMBER_LIST_UPDATE data.
-    findByTypeNameAll("UserRow").forEach(UserRow => {
-        if (!UserRow?.type) return;
-        unpatches.push(after("type", UserRow, ([props], result) => {
-            return isBlocked(directMemberId(props)) ? null : result;
-        }));
-    });
 }
 
 function registerCommands() {
@@ -379,9 +334,11 @@ function registerCommands() {
             if (userId === UserStore?.getCurrentUser?.()?.id) return failure("Нельзя скрыть самого себя");
             if (isBlocked(userId)) return failure(`${nameFor(userId)} уже скрыт`);
 
+            const dmChannels = findDirectMessages(userId);
             storage.users = [...blockedIds(), userId];
             muteVoice(userId);
             removeMountedMessages(userId);
+            hideDirectMessages(userId, dmChannels);
             refreshLists();
             FluxDispatcher.dispatch({ type: "BLACKLIST_REFRESH" });
             success(`${nameFor(userId)} добавлен в список`);
@@ -399,8 +356,65 @@ function registerCommands() {
 
             storage.users = blockedIds().filter(id => id !== userId);
             restoreVoice(userId);
+            restoreDirectMessage(userId);
             refreshLists();
             void refreshMessages();
+        }
+    } as any));
+
+    unregisterCommands.push(registerCommand({
+        name: "blockdebug",
+        description: "Copy Blacklist diagnostics for the current Discord screen",
+        options: [],
+        execute: (_args, ctx) => {
+            const describe = (value: any, depth = 0): any => {
+                if (value == null || typeof value !== "object") return value;
+                if (depth > 2) return Array.isArray(value) ? `[Array:${value.length}]` : "[Object]";
+                if (Array.isArray(value)) return value.slice(0, 3).map(item => describe(item, depth + 1));
+                const output: AnyRecord = {};
+                for (const key of Object.keys(value).slice(0, 30)) {
+                    try { output[key] = describe(value[key], depth + 1); } catch { output[key] = "[Error]"; }
+                }
+                return output;
+            };
+
+            const moduleName = (value: any) => value?.name
+                ?? value?.displayName
+                ?? value?.type?.name
+                ?? value?.type?.displayName;
+
+            const componentNames = findAll(value => {
+                const name = moduleName(value);
+                return typeof name === "string" && /member|channel.*detail|detail.*channel/i.test(name);
+            }).map(moduleName).filter(Boolean);
+
+            const memberStores = findAll(value => {
+                try { return typeof value?.getName === "function" && /member/i.test(value.getName()); }
+                catch { return false; }
+            }).map(store => ({
+                name: store.getName(),
+                methods: Object.keys(store).filter(key => typeof store[key] === "function").slice(0, 50)
+            }));
+
+            let channelMemberProps: any;
+            let threadSections: any;
+            try { channelMemberProps = ChannelMemberStore?.getProps?.(ctx?.guild?.id, ctx?.channel?.id); } catch (error) { channelMemberProps = String(error); }
+            try { threadSections = ThreadMemberListStore?.getMemberListSections?.(ctx?.channel?.id); } catch (error) { threadSections = String(error); }
+
+            const report = JSON.stringify({
+                blockedIds: blockedIds(),
+                guildId: ctx?.guild?.id,
+                channelId: ctx?.channel?.id,
+                componentNames: [...new Set(componentNames)],
+                memberStores,
+                channelMemberProps: describe(channelMemberProps),
+                threadSections: describe(threadSections),
+                channelStoreMethods: Object.keys(ChannelStore ?? {}).filter(key => /private|dm/i.test(key)),
+                privateSortMethods: Object.keys(PrivateChannelSortStore ?? {}).filter(key => typeof PrivateChannelSortStore[key] === "function")
+            }, null, 2);
+
+            clipboard.setString(report);
+            success("Диагностика Block скопирована в буфер");
         }
     } as any));
 }
@@ -415,6 +429,7 @@ export default {
         patchStores();
         registerCommands();
         blockedIds().forEach(muteVoice);
+        blockedIds().forEach(userId => hideDirectMessages(userId));
         logger.log("Blacklist loaded");
     },
 
