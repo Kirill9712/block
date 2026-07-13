@@ -428,14 +428,26 @@ function patchStores() {
         }));
     }
 
-    for (const method of ["getVoiceStatesForChannel", "getVoiceStates", "getVoiceStatesForGuild", "getVoiceStateForChannel"]) {
+    for (const method of [
+        "getVoiceStatesForChannel",
+        "getVoiceStates",
+        "getVoiceStatesForGuild",
+        "getVoiceStateForChannel",
+        "getAllVoiceStates",
+        "getVideoVoiceStatesForChannel",
+        "getVoiceState",
+        "getDiscoverableVoiceState",
+        "getVoiceStateForSession"
+    ]) {
         if (typeof VoiceStateStore?.[method] !== "function") continue;
         unpatches.push(after(method, VoiceStateStore, (_args, result) => filterVoiceCollection(result)));
     }
 
-    if (typeof VoiceStateStore?.getVoiceStateForUser === "function") {
-        unpatches.push(after("getVoiceStateForUser", VoiceStateStore, ([userId], result) => {
-            return isBlocked(userId) || isBlocked(voiceUserId(result)) ? undefined : result;
+    for (const method of ["getVoiceStateForUser", "getDiscoverableVoiceStateForUser", "getUserVoiceChannelId"]) {
+        if (typeof VoiceStateStore?.[method] !== "function") continue;
+        unpatches.push(after(method, VoiceStateStore, (args, result) => {
+            const requestedBlockedUser = args.some((arg: any) => typeof arg === "string" && isBlocked(arg));
+            return requestedBlockedUser || isBlocked(voiceUserId(result)) ? undefined : result;
         }));
     }
 
