@@ -31,6 +31,10 @@ let patchedMemberModules = new WeakSet<object>();
 let patchedMemberComponentCount = 0;
 let memberRowRenderCount = 0;
 let lastMemberRowProps: any;
+let patchedVoiceModules = new WeakSet<object>();
+let patchedVoiceComponentCount = 0;
+let voiceRowRenderCount = 0;
+let lastVoiceRowProps: any;
 
 function blockedIds(): string[] {
     storage.users ??= [];
@@ -316,7 +320,12 @@ function voiceUserId(value: any): string | undefined {
         ?? getUserId(value?.user_id)
         ?? getUserId(value?.user?.id)
         ?? getUserId(value?.member?.userId)
-        ?? getUserId(value?.member?.user?.id);
+        ?? getUserId(value?.member?.user?.id)
+        ?? getUserId(value?.voiceState?.userId)
+        ?? getUserId(value?.voiceState?.user_id)
+        ?? getUserId(value?.voiceState?.user?.id)
+        ?? getUserId(value?.participant?.userId)
+        ?? getUserId(value?.participant?.user?.id);
 }
 
 function filterVoiceCollection(result: any): any {
@@ -341,6 +350,68 @@ function filterVoiceCollection(result: any): any {
     return Object.fromEntries(Object.entries(result)
         .filter(([key, value]) => !isBlocked(key) && !isBlocked(voiceUserId(value)))
         .map(([key, value]) => [key, filterVoiceCollection(value)]));
+}
+
+function pruneVoiceTree(node: any, depth = 0, seen = new Set<any>()): any {
+    if (node == null || depth > 20) return node;
+    if (Array.isArray(node)) {
+        return node.map(value => pruneVoiceTree(value, depth + 1, seen)).filter(value => value != null);
+    }
+    if (typeof node !== "object" || seen.has(node)) return node;
+    seen.add(node);
+
+    const props = node.props;
+    if (!props || typeof props !== "object") return node;
+    if (isBlocked(voiceUserId(props))) return null;
+
+    let changed = false;
+    const nextProps: AnyRecord = { ...props };
+    if ("children" in props) {
+        const children = pruneVoiceTree(props.children, depth + 1, seen);
+        if (children !== props.children) {
+            nextProps.children = children;
+            changed = true;
+        }
+    }
+
+    for (const key of ["data", "voiceStates", "users", "members", "participants"]) {
+        if (!(key in props)) continue;
+        const filtered = filterVoiceCollection(props[key]);
+        if (filtered !== props[key]) {
+            nextProps[key] = filtered;
+            changed = true;
+        }
+    }
+    return changed ? { ...node, props: nextProps } : node;
+}
+
+function patchVoiceComponent(target: any, method: string): boolean {
+    if (!target || typeof target !== "object" || patchedVoiceModules.has(target) || typeof target[method] !== "function") return false;
+    patchedVoiceModules.add(target);
+    unpatches.push(after(method, target, ([props], result) => {
+        voiceRowRenderCount++;
+        lastVoiceRowProps = props;
+        return pruneVoiceTree(result);
+    }));
+    patchedVoiceComponentCount++;
+    return true;
+}
+
+function patchVoiceRows() {
+    try {
+        const raw = findByName("GuildVoiceChannelRow", false);
+        if (raw && typeof raw === "object") {
+            for (const key of Object.keys(raw)) {
+                if (raw[key]?.name === "GuildVoiceChannelRow" || key === "default") patchVoiceComponent(raw, key);
+            }
+        }
+    } catch { }
+
+    try {
+        for (const wrapper of findByTypeNameAll("GuildVoiceChannelRow")) {
+            if (wrapper?.type?.name === "GuildVoiceChannelRow") patchVoiceComponent(wrapper, "type");
+        }
+    } catch { }
 }
 
 function filterChannelMemberProps(result: any) {
@@ -571,6 +642,11 @@ function registerCommands() {
                     renderCalls: memberRowRenderCount,
                     lastProps: describe(lastMemberRowProps)
                 },
+                voicePatch: {
+                    patchedComponents: patchedVoiceComponentCount,
+                    renderCalls: voiceRowRenderCount,
+                    lastProps: describe(lastVoiceRowProps)
+                },
                 memberStores,
                 channelMemberProps: describe(channelMemberProps),
                 threadSections: describe(threadSections),
@@ -602,7 +678,11 @@ export default {
         patchDispatcher();
         patchStores();
         patchMembersTab();
-        memberPatchTimer = setInterval(patchMembersTab, 1000);
+        patchVoiceRows();
+        memberPatchTimer = setInterval(() => {
+            patchMembersTab();
+            patchVoiceRows();
+        }, 1000);
         registerCommands();
         blockedIds().forEach(muteVoice);
         blockedIds().forEach(userId => hideDirectMessages(userId));
@@ -615,9 +695,13 @@ export default {
         memberPatchTimer = undefined;
         unpatches.splice(0).reverse().forEach(unpatch => unpatch());
         patchedMemberModules = new WeakSet<object>();
+        patchedVoiceModules = new WeakSet<object>();
         patchedMemberComponentCount = 0;
         memberRowRenderCount = 0;
         lastMemberRowProps = undefined;
+        patchedVoiceComponentCount = 0;
+        voiceRowRenderCount = 0;
+        lastVoiceRowProps = undefined;
         blockedIds().forEach(restoreVoice);
         logger.log("Blacklist unloaded");
     }
