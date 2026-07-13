@@ -39,6 +39,7 @@ let voiceRowRenderCount = 0;
 let lastVoiceRowProps: any;
 let originalGetVoiceStateForUser: ((userId: string) => any) | undefined;
 let originalGetVoiceStatesForChannel: ((channelId: string) => any) | undefined;
+let pluginActive = false;
 
 function blockedIds(): string[] {
     storage.users ??= [];
@@ -554,6 +555,11 @@ function patchDispatcher() {
             });
             if (channelsToCheck.size) setTimeout(() => channelsToCheck.forEach(hideEmptyVoiceChannel), 0);
         }
+
+        if (event.type === "CONNECTION_OPEN" || event.type === "CACHE_LOADED") {
+            setTimeout(() => pluginActive && blockedIds().forEach(userId => hideDirectMessages(userId)), 0);
+            setTimeout(() => pluginActive && blockedIds().forEach(userId => hideDirectMessages(userId)), 1500);
+        }
     }));
 }
 
@@ -740,6 +746,7 @@ function registerCommands() {
 
 export default {
     onLoad() {
+        pluginActive = true;
         storage.users ??= [];
         storage.voiceVolumes ??= {};
         storage.soundboardMutes ??= {};
@@ -753,6 +760,7 @@ export default {
         memberPatchTimer = setInterval(() => {
             patchMembersTab();
             patchVoiceRows();
+            blockedIds().forEach(userId => hideDirectMessages(userId));
         }, 1000);
         registerCommands();
         blockedIds().forEach(muteVoice);
@@ -762,6 +770,7 @@ export default {
     },
 
     onUnload() {
+        pluginActive = false;
         unregisterCommands.splice(0).forEach(unregister => unregister());
         if (memberPatchTimer) clearInterval(memberPatchTimer);
         memberPatchTimer = undefined;
@@ -774,6 +783,7 @@ export default {
         patchedVoiceComponentCount = 0;
         voiceRowRenderCount = 0;
         lastVoiceRowProps = undefined;
+        blockedIds().forEach(restoreDirectMessage);
         blockedIds().forEach(restoreVoicePresence);
         [...hiddenVoiceChannels.keys()].forEach(restoreVoiceChannel);
         originalGetVoiceStateForUser = undefined;
