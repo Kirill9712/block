@@ -7,10 +7,14 @@
 Добавьте этот адрес в **Revenge → Plugins**:
 
 ```text
-https://raw.githubusercontent.com/Kirill9712/block/main/
+https://kirill9712.github.io/block/
 ```
 
-Этот адрес работает напрямую и не требует включения GitHub Pages.
+Если GitHub Pages ещё не включён, можно использовать прямой адрес:
+
+```text
+https://raw.githubusercontent.com/Kirill9712/block/main/
+```
 
 ## Команды
 
