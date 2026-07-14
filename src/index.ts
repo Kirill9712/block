@@ -22,6 +22,8 @@ const ChannelStore = findByStoreName("ChannelStore");
 const PrivateChannelSortStore = findByStoreName("PrivateChannelSortStore");
 const ChannelMemberStore = findByStoreName("ChannelMemberStore");
 const ThreadMemberListStore = findByStoreName("ThreadMemberListStore");
+const UserGuildSettingsStore = findByStoreName("UserGuildSettingsStore");
+const NotificationSettingsActions = findByProps("updateChannelOverrideSettings");
 const hiddenDmChannels = new Map<string, any>();
 const hiddenVoiceStates = new Map<string, any>();
 const hiddenVoiceChannels = new Map<string, any>();
@@ -299,7 +301,76 @@ function findDirectMessages(userId: string): any[] {
     return result;
 }
 
+function savedDmNotificationSettings(): AnyRecord {
+    storage.dmNotificationSettings ??= {};
+    return storage.dmNotificationSettings;
+}
+
+function channelNotificationOverride(channelId: string): any {
+    try {
+        return UserGuildSettingsStore?.getChannelOverrides?.(null)?.[channelId]
+            ?? UserGuildSettingsStore?.getChannelOverrides?.("@me")?.[channelId]
+            ?? null;
+    } catch {
+        return null;
+    }
+}
+
+function muteDmNotifications(userId: string, channels = findDirectMessages(userId)) {
+    if (!NotificationSettingsActions?.updateChannelOverrideSettings) return;
+
+    const saved = savedDmNotificationSettings();
+    for (const channel of channels) {
+        if (!channel?.id) continue;
+        if (!(channel.id in saved)) {
+            const override = channelNotificationOverride(channel.id);
+            saved[channel.id] = {
+                userId,
+                override: override ? {
+                    muted: !!override.muted,
+                    mute_config: override.mute_config ?? null,
+                    message_notifications: override.message_notifications ?? 3
+                } : null
+            };
+        }
+
+        try {
+            const result = NotificationSettingsActions.updateChannelOverrideSettings(null, channel.id, {
+                muted: true,
+                mute_config: { end_time: null, selected_time_window: -1 },
+                message_notifications: 2
+            });
+            Promise.resolve(result).catch(error => logger.warn("Failed to mute blocked DM notifications", error));
+        } catch (error) {
+            logger.warn("Failed to mute blocked DM notifications", error);
+        }
+    }
+}
+
+function restoreDmNotifications(userId: string) {
+    if (!NotificationSettingsActions?.updateChannelOverrideSettings) return;
+
+    const saved = savedDmNotificationSettings();
+    for (const [channelId, state] of Object.entries(saved)) {
+        if ((state as any)?.userId !== userId) continue;
+        const override = (state as any)?.override ?? {
+            muted: false,
+            mute_config: null,
+            message_notifications: 3
+        };
+
+        try {
+            const result = NotificationSettingsActions.updateChannelOverrideSettings(null, channelId, override);
+            Promise.resolve(result).catch(error => logger.warn("Failed to restore DM notifications", error));
+        } catch (error) {
+            logger.warn("Failed to restore DM notifications", error);
+        }
+        delete saved[channelId];
+    }
+}
+
 function hideDirectMessages(userId: string, knownChannels = findDirectMessages(userId)) {
+    muteDmNotifications(userId, knownChannels);
     for (const channel of knownChannels) {
         hiddenDmChannels.set(userId, channel);
         FluxDispatcher.dispatch({ type: "CHANNEL_DELETE", channel });
@@ -647,6 +718,7 @@ function registerCommands() {
             storage.users = blockedIds().filter(id => id !== userId);
             restoreVoice(userId);
             restoreVoicePresence(userId);
+            restoreDmNotifications(userId);
             restoreDirectMessage(userId);
             refreshLists();
             void refreshMessages();
@@ -750,6 +822,7 @@ export default {
         storage.users ??= [];
         storage.voiceVolumes ??= {};
         storage.soundboardMutes ??= {};
+        storage.dmNotificationSettings ??= {};
         originalGetVoiceStateForUser = VoiceStateStore?.getVoiceStateForUser?.bind(VoiceStateStore);
         originalGetVoiceStatesForChannel = VoiceStateStore?.getVoiceStatesForChannel?.bind(VoiceStateStore);
 
@@ -783,6 +856,7 @@ export default {
         patchedVoiceComponentCount = 0;
         voiceRowRenderCount = 0;
         lastVoiceRowProps = undefined;
+        blockedIds().forEach(restoreDmNotifications);
         blockedIds().forEach(restoreDirectMessage);
         blockedIds().forEach(restoreVoicePresence);
         [...hiddenVoiceChannels.keys()].forEach(restoreVoiceChannel);
