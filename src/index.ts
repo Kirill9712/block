@@ -149,6 +149,36 @@ function stripBlockedReply(message: any) {
     };
 }
 
+function stripBlockedMentions(message: any) {
+    if (!message || typeof message !== "object") return message;
+
+    let changed = false;
+    let content = message.content;
+    if (typeof content === "string") {
+        const filtered = content.replace(/<@!?(\d{17,20})>/g, (mention: string, userId: string) => {
+            if (!isBlocked(userId)) return mention;
+            changed = true;
+            return "";
+        });
+        if (filtered !== content) content = filtered;
+    }
+
+    let mentions = message.mentions;
+    if (Array.isArray(mentions)) {
+        const filtered = mentions.filter((user: any) => !isBlocked(user?.id));
+        if (filtered.length !== mentions.length) {
+            mentions = filtered;
+            changed = true;
+        }
+    }
+
+    return changed ? { ...message, content, mentions } : message;
+}
+
+function sanitizeMessage(message: any) {
+    return stripBlockedMentions(stripBlockedReply(message));
+}
+
 function messageArray(value: any): any[] | undefined {
     if (Array.isArray(value)) return value;
     if (Array.isArray(value?._array)) return value._array;
@@ -162,14 +192,26 @@ function removeMountedMessages(userId: string) {
         if (!channelId || !messages) return;
 
         for (const message of messages) {
-            if (message?.author?.id !== userId) continue;
-            FluxDispatcher.dispatch({
-                type: "MESSAGE_DELETE",
-                channelId,
-                id: message.id,
-                message: message.id,
-                blacklistLocal: true
-            });
+            if (message?.author?.id === userId) {
+                FluxDispatcher.dispatch({
+                    type: "MESSAGE_DELETE",
+                    channelId,
+                    id: message.id,
+                    message: message.id,
+                    blacklistLocal: true
+                });
+                continue;
+            }
+
+            const sanitized = sanitizeMessage(message);
+            if (sanitized !== message) {
+                FluxDispatcher.dispatch({
+                    type: "MESSAGE_UPDATE",
+                    channelId,
+                    message: sanitized,
+                    blacklistLocal: true
+                });
+            }
         }
     } catch (error) {
         logger.warn("Failed to remove already mounted messages", error);
@@ -576,7 +618,7 @@ function patchDispatcher() {
         if (event.type === "LOAD_MESSAGES_SUCCESS" && Array.isArray(event.messages)) {
             event.messages = event.messages
                 .filter(message => !isBlocked(message?.author?.id))
-                .map(stripBlockedReply);
+                .map(sanitizeMessage);
             return;
         }
 
@@ -587,7 +629,7 @@ function patchDispatcher() {
         }
 
         if ((event.type === "MESSAGE_CREATE" || event.type === "MESSAGE_UPDATE") && event.message) {
-            event.message = stripBlockedReply(event.message);
+            event.message = sanitizeMessage(event.message);
             return;
         }
 
@@ -678,6 +720,21 @@ function registerCommands() {
         type: 6,
         required: false
     }];
+    const unblockUserOption: any = {
+        name: "user",
+        description: "Выберите пользователя из чёрного списка",
+        type: 3,
+        required: true,
+        choices: []
+    };
+    const refreshUnblockChoices = () => {
+        unblockUserOption.choices = blockedIds().map(userId => {
+            const user = UserStore?.getUser?.(userId);
+            const name = user?.globalName ?? user?.username ?? userId;
+            return { name, displayName: name, label: name, value: userId };
+        });
+    };
+    refreshUnblockChoices();
 
     unregisterCommands.push(registerCommand({
         name: "block",
@@ -696,6 +753,7 @@ function registerCommands() {
             const dmChannels = findDirectMessages(userId);
             const voiceState = currentVoiceState(userId);
             storage.users = [...blockedIds(), userId];
+            refreshUnblockChoices();
             muteVoice(userId);
             hideVoicePresence(userId, voiceState);
             removeMountedMessages(userId);
@@ -709,13 +767,14 @@ function registerCommands() {
     unregisterCommands.push(registerCommand({
         name: "unblock",
         description: "Перестать скрывать пользователя",
-        options: userOption,
+        options: [unblockUserOption],
         execute: args => {
             const userId = commandUserId(args);
             if (!userId) return failure("Выберите пользователя или вставьте его ID");
             if (!isBlocked(userId)) return failure(`${nameFor(userId)} отсутствует в списке`);
 
             storage.users = blockedIds().filter(id => id !== userId);
+            refreshUnblockChoices();
             restoreVoice(userId);
             restoreVoicePresence(userId);
             restoreDmNotifications(userId);
