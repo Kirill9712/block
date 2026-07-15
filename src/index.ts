@@ -27,6 +27,7 @@ const NotificationSettingsActions = findByProps("updateChannelOverrideSettings")
 const hiddenDmChannels = new Map<string, any>();
 const hiddenVoiceStates = new Map<string, any>();
 const hiddenVoiceChannels = new Map<string, any>();
+const hiddenMessages = new Map<string, Map<string, any>>();
 
 let unpatches: Array<() => void> = [];
 let unregisterCommands: Array<() => void> = [];
@@ -185,6 +186,35 @@ function messageArray(value: any): any[] | undefined {
     if (Array.isArray(value?.toArray?.())) return value.toArray();
 }
 
+function rememberHiddenMessage(message: any) {
+    const userId = message?.author?.id;
+    if (!userId || !message?.id) return;
+    let messages = hiddenMessages.get(userId);
+    if (!messages) hiddenMessages.set(userId, messages = new Map());
+    messages.set(message.id, message);
+}
+
+function restoreHiddenMessages(userId: string) {
+    const messages = hiddenMessages.get(userId);
+    hiddenMessages.delete(userId);
+    if (!messages) return;
+
+    for (const message of [...messages.values()].sort((a, b) => {
+        try { return BigInt(a.id) < BigInt(b.id) ? -1 : 1; }
+        catch { return 0; }
+    })) {
+        FluxDispatcher.dispatch({
+            type: "MESSAGE_CREATE",
+            channelId: message.channel_id ?? message.channelId,
+            message,
+            optimistic: false,
+            isPushNotification: false,
+            isHistory: true,
+            blacklistLocal: true
+        });
+    }
+}
+
 function removeMountedMessages(userId: string) {
     try {
         const channelId = SelectedChannelStore?.getChannelId?.();
@@ -193,6 +223,7 @@ function removeMountedMessages(userId: string) {
 
         for (const message of messages) {
             if (message?.author?.id === userId) {
+                rememberHiddenMessage(message);
                 FluxDispatcher.dispatch({
                     type: "MESSAGE_DELETE",
                     channelId,
@@ -616,6 +647,7 @@ function patchDispatcher() {
         if (!event || typeof event !== "object") return;
 
         if (event.type === "LOAD_MESSAGES_SUCCESS" && Array.isArray(event.messages)) {
+            event.messages.filter(message => isBlocked(message?.author?.id)).forEach(rememberHiddenMessage);
             event.messages = event.messages
                 .filter(message => !isBlocked(message?.author?.id))
                 .map(sanitizeMessage);
@@ -623,6 +655,7 @@ function patchDispatcher() {
         }
 
         if ((event.type === "MESSAGE_CREATE" || event.type === "MESSAGE_UPDATE") && isBlocked(event.message?.author?.id)) {
+            rememberHiddenMessage(event.message);
             event.type = "BLACKLIST_IGNORED_MESSAGE";
             event.message = null;
             return;
@@ -775,6 +808,7 @@ function registerCommands() {
 
             storage.users = blockedIds().filter(id => id !== userId);
             refreshUnblockChoices();
+            restoreHiddenMessages(userId);
             restoreVoice(userId);
             restoreVoicePresence(userId);
             restoreDmNotifications(userId);
@@ -895,6 +929,7 @@ export default {
             blockedIds().forEach(userId => hideDirectMessages(userId));
         }, 1000);
         registerCommands();
+        blockedIds().forEach(removeMountedMessages);
         blockedIds().forEach(muteVoice);
         blockedIds().forEach(userId => hideVoicePresence(userId));
         blockedIds().forEach(userId => hideDirectMessages(userId));
@@ -907,6 +942,8 @@ export default {
         if (memberPatchTimer) clearInterval(memberPatchTimer);
         memberPatchTimer = undefined;
         unpatches.splice(0).reverse().forEach(unpatch => unpatch());
+        blockedIds().forEach(restoreHiddenMessages);
+        hiddenMessages.clear();
         patchedMemberModules = new WeakSet<object>();
         patchedVoiceModules = new WeakSet<object>();
         patchedMemberComponentCount = 0;
