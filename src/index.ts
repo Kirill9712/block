@@ -28,6 +28,7 @@ const hiddenDmChannels = new Map<string, any>();
 const hiddenVoiceStates = new Map<string, any>();
 const hiddenVoiceChannels = new Map<string, any>();
 const hiddenMessages = new Map<string, Map<string, any>>();
+const messageCollectionProxies = new WeakMap<object, any>();
 
 let unpatches: Array<() => void> = [];
 let unregisterCommands: Array<() => void> = [];
@@ -186,6 +187,44 @@ function messageArray(value: any): any[] | undefined {
     if (Array.isArray(value?.toArray?.())) return value.toArray();
 }
 
+function visibleMessages(messages: any[]): any[] {
+    return messages.filter(message => !isBlocked(message?.author?.id)).map(sanitizeMessage);
+}
+
+function filterMessageCollection(value: any): any {
+    if (Array.isArray(value)) return visibleMessages(value);
+    if (!value || typeof value !== "object") return value;
+
+    const cached = messageCollectionProxies.get(value);
+    if (cached) return cached;
+
+    const proxy = new Proxy(value, {
+        get(target, property) {
+            const source = messageArray(target);
+            if (!source) {
+                const result = Reflect.get(target, property, target);
+                return typeof result === "function" ? result.bind(target) : result;
+            }
+
+            const messages = visibleMessages(source);
+            if (property === "_array") return messages;
+            if (property === "length" || property === "size") return messages.length;
+            if (property === "toArray") return () => messages;
+            if (property === Symbol.iterator || property === "values") return messages.values.bind(messages);
+            if (property === "map" || property === "filter" || property === "forEach" || property === "at") {
+                return (messages as any)[property].bind(messages);
+            }
+            if (property === "first") return () => messages[0];
+            if (property === "last") return () => messages[messages.length - 1];
+
+            const result = Reflect.get(target, property, target);
+            return typeof result === "function" ? result.bind(target) : result;
+        }
+    });
+    messageCollectionProxies.set(value, proxy);
+    return proxy;
+}
+
 function rememberHiddenMessage(message: any) {
     const userId = message?.author?.id;
     if (!userId || !message?.id) return;
@@ -224,13 +263,6 @@ function removeMountedMessages(userId: string) {
         for (const message of messages) {
             if (message?.author?.id === userId) {
                 rememberHiddenMessage(message);
-                FluxDispatcher.dispatch({
-                    type: "MESSAGE_DELETE",
-                    channelId,
-                    id: message.id,
-                    message: message.id,
-                    blacklistLocal: true
-                });
                 continue;
             }
 
@@ -244,6 +276,7 @@ function removeMountedMessages(userId: string) {
                 });
             }
         }
+        MessageStore?.emitChange?.();
     } catch (error) {
         logger.warn("Failed to remove already mounted messages", error);
     }
@@ -446,14 +479,46 @@ function hideDirectMessages(userId: string, knownChannels = findDirectMessages(u
     muteDmNotifications(userId, knownChannels);
     for (const channel of knownChannels) {
         hiddenDmChannels.set(userId, channel);
-        FluxDispatcher.dispatch({ type: "CHANNEL_DELETE", channel });
     }
+    refreshLists();
 }
 
 function restoreDirectMessage(userId: string) {
-    const channel = hiddenDmChannels.get(userId);
-    if (channel) FluxDispatcher.dispatch({ type: "CHANNEL_CREATE", channel });
     hiddenDmChannels.delete(userId);
+    refreshLists();
+}
+
+function isBlockedDirectMessage(value: any): boolean {
+    const channel = typeof value === "string" ? ChannelStore?.getChannel?.(value) : value;
+    return !!channel
+        && (channel.type === 1 || channel.isDM?.())
+        && recipientIds(channel).some(isBlocked);
+}
+
+function filterPrivateChannels(value: any): any {
+    if (Array.isArray(value)) return value.filter(item => !isBlockedDirectMessage(item));
+    if (value instanceof Map) {
+        return new Map([...value.entries()].filter(([key, item]) => {
+            return !isBlockedDirectMessage(item) && !isBlockedDirectMessage(key);
+        }));
+    }
+    if (!value || typeof value !== "object") return value;
+
+    let changed = false;
+    const result: AnyRecord = { ...value };
+    for (const [key, item] of Object.entries(result)) {
+        if (isBlockedDirectMessage(item) || isBlockedDirectMessage(key)) {
+            delete result[key];
+            changed = true;
+        } else if (Array.isArray(item)) {
+            const filtered = item.filter(entry => !isBlockedDirectMessage(entry));
+            if (filtered.length !== item.length) {
+                result[key] = filtered;
+                changed = true;
+            }
+        }
+    }
+    return changed ? result : value;
 }
 
 function currentVoiceState(userId: string): any {
@@ -677,9 +742,7 @@ function patchDispatcher() {
         if (event.type === "CHANNEL_CREATE" && createdDmIsBlocked) {
             const userId = recipientIds(event.channel).find(isBlocked);
             if (userId) hiddenDmChannels.set(userId, event.channel);
-            event.type = "BLACKLIST_IGNORED_DM";
-            event.channel = null;
-            return;
+            setTimeout(refreshLists, 0);
         }
 
         if (event.type === "VOICE_STATE_UPDATES" && Array.isArray(event.voiceStates)) {
@@ -710,6 +773,24 @@ function patchDispatcher() {
 }
 
 function patchStores() {
+    if (MessageStore?.getMessages) {
+        unpatches.push(after("getMessages", MessageStore, (_args, result) => filterMessageCollection(result)));
+    }
+
+    for (const store of [PrivateChannelSortStore, ChannelStore]) {
+        const privateChannelMethods = new Set<string>();
+        let prototype = store;
+        for (let depth = 0; prototype && depth < 4; depth++, prototype = Object.getPrototypeOf(prototype)) {
+            for (const key of Reflect.ownKeys(prototype)) {
+                if (typeof key === "string" && /(private|direct).*channel|channel.*(private|direct)/i.test(key)
+                    && typeof store?.[key] === "function") privateChannelMethods.add(key);
+            }
+        }
+        for (const method of privateChannelMethods) {
+            unpatches.push(after(method, store, (_args, result) => filterPrivateChannels(result)));
+        }
+    }
+
     if (TypingStore?.getTypingUsers) {
         unpatches.push(after("getTypingUsers", TypingStore, (_args, result) => {
             if (!result || typeof result !== "object") return result;
