@@ -41,8 +41,6 @@ let patchedVoiceModules = new WeakSet<object>();
 let patchedVoiceComponentCount = 0;
 let voiceRowRenderCount = 0;
 let lastVoiceRowProps: any;
-let patchedMessageModules = new WeakSet<object>();
-let patchedDmModules = new WeakSet<object>();
 let originalGetVoiceStateForUser: ((userId: string) => any) | undefined;
 let originalGetVoiceStatesForChannel: ((channelId: string) => any) | undefined;
 let pluginActive = false;
@@ -375,64 +373,6 @@ function patchMembersTab() {
     } catch { }
 }
 
-function componentName(value: any): string | undefined {
-    return value?.name ?? value?.displayName ?? value?.type?.name ?? value?.type?.displayName;
-}
-
-function messageFromProps(value: any, depth = 0, seen = new Set<any>()): any {
-    if (!value || typeof value !== "object" || depth > 5 || seen.has(value)) return;
-    seen.add(value);
-    if (value.author?.id && (value.id || value.channel_id || value.channelId)) return value;
-
-    for (const [key, nested] of Object.entries(value)) {
-        if (!/message|item|data|record|entry|row|payload/i.test(key)) continue;
-        const message = messageFromProps(nested, depth + 1, seen);
-        if (message) return message;
-    }
-}
-
-function patchMessageComponent(target: any, method: string): boolean {
-    if (!target || typeof target !== "object" || patchedMessageModules.has(target) || typeof target[method] !== "function") return false;
-    patchedMessageModules.add(target);
-    unpatches.push(after(method, target, ([props], result) => {
-        const message = messageFromProps(props);
-        return message && isBlocked(message.author?.id) ? null : result;
-    }));
-    return true;
-}
-
-function patchMessageRows() {
-    const names = new Set(["Message", "MessageRow", "MessageListItem", "MessageContent", "MessageItem", "ChatMessage"]);
-    try {
-        for (const module of findAll(value => names.has(componentName(value)))) {
-            if (!module || typeof module !== "object") continue;
-            for (const key of Object.keys(module)) {
-                if (names.has(componentName(module[key])) || (key === "default" && typeof module[key] === "function")) {
-                    patchMessageComponent(module, key);
-                }
-            }
-        }
-    } catch { }
-
-    for (const name of names) {
-        try {
-            const raw = findByName(name, false);
-            if (raw && typeof raw === "object") {
-                for (const key of Object.keys(raw)) {
-                    if (componentName(raw[key]) === name || (key === "default" && typeof raw[key] === "function")) {
-                        patchMessageComponent(raw, key);
-                    }
-                }
-            }
-        } catch { }
-        try {
-            for (const wrapper of findByTypeNameAll(name)) {
-                if (componentName(wrapper?.type) === name) patchMessageComponent(wrapper, "type");
-            }
-        } catch { }
-    }
-}
-
 function privateChannels(): any[] {
     const channels = new Map<string, any>();
     for (const method of ["getSortedPrivateChannels", "getPrivateChannels", "getMutablePrivateChannels"]) {
@@ -553,61 +493,6 @@ function isBlockedDirectMessage(value: any): boolean {
     return !!channel
         && (channel.type === 1 || channel.isDM?.())
         && recipientIds(channel).some(isBlocked);
-}
-
-function directMessageFromProps(value: any, depth = 0, seen = new Set<any>()): any {
-    if (!value || typeof value !== "object" || depth > 5 || seen.has(value)) return;
-    seen.add(value);
-    if (isBlockedDirectMessage(value)) return value;
-
-    for (const [key, nested] of Object.entries(value)) {
-        if (!/channel|item|data|record|entry|row|payload/i.test(key)) continue;
-        if (typeof nested === "string") {
-            const channel = ChannelStore?.getChannel?.(nested);
-            if (isBlockedDirectMessage(channel)) return channel;
-        }
-        const channel = directMessageFromProps(nested, depth + 1, seen);
-        if (channel) return channel;
-    }
-}
-
-function patchDmComponent(target: any, method: string): boolean {
-    if (!target || typeof target !== "object" || patchedDmModules.has(target) || typeof target[method] !== "function") return false;
-    patchedDmModules.add(target);
-    unpatches.push(after(method, target, ([props], result) => directMessageFromProps(props) ? null : result));
-    return true;
-}
-
-function patchDmRows() {
-    const names = new Set(["DMRow", "GroupDMRow", "HomeDrawerDMsRowWrapper", "ChannelRow", "ChannelRowItem", "BaseChannelItem"]);
-    try {
-        for (const module of findAll(value => names.has(componentName(value)))) {
-            if (!module || typeof module !== "object") continue;
-            for (const key of Object.keys(module)) {
-                if (names.has(componentName(module[key])) || (key === "default" && typeof module[key] === "function")) {
-                    patchDmComponent(module, key);
-                }
-            }
-        }
-    } catch { }
-
-    for (const name of names) {
-        try {
-            const raw = findByName(name, false);
-            if (raw && typeof raw === "object") {
-                for (const key of Object.keys(raw)) {
-                    if (componentName(raw[key]) === name || (key === "default" && typeof raw[key] === "function")) {
-                        patchDmComponent(raw, key);
-                    }
-                }
-            }
-        } catch { }
-        try {
-            for (const wrapper of findByTypeNameAll(name)) {
-                if (componentName(wrapper?.type) === name) patchDmComponent(wrapper, "type");
-            }
-        } catch { }
-    }
 }
 
 function filterPrivateChannels(value: any): any {
@@ -1119,13 +1004,9 @@ export default {
         patchStores();
         patchMembersTab();
         patchVoiceRows();
-        patchMessageRows();
-        patchDmRows();
         memberPatchTimer = setInterval(() => {
             patchMembersTab();
             patchVoiceRows();
-            patchMessageRows();
-            patchDmRows();
             blockedIds().forEach(userId => hideDirectMessages(userId));
         }, 1000);
         registerCommands();
@@ -1146,8 +1027,6 @@ export default {
         hiddenMessages.clear();
         patchedMemberModules = new WeakSet<object>();
         patchedVoiceModules = new WeakSet<object>();
-        patchedMessageModules = new WeakSet<object>();
-        patchedDmModules = new WeakSet<object>();
         patchedMemberComponentCount = 0;
         memberRowRenderCount = 0;
         lastMemberRowProps = undefined;
